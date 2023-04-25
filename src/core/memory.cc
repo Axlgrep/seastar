@@ -206,6 +206,14 @@ static char* mem_base() {
     static std::once_flag flag;
     std::call_once(flag, [] {
         size_t alloc = size_t(1) << 44;
+        /* 映射一块大小为16T的虚拟内存,
+         * MAP_PRIVATE:  
+         *     这是一个copy-on-write的映射方式, 但在写入数据时, 他会在物理内存
+         *     copy一份数据出来(以页为单位)，而且这些数据是不会被回写到文件的, 
+         *     若更新的数据超过可用物理内存 + swap space，就会遇到OOM Killer.
+         * MAP_ANONYMOUS:
+         * MAP_NORESERVE:
+         */
         auto r = ::mmap(NULL, 2 * alloc,
                     PROT_NONE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
@@ -226,6 +234,7 @@ constexpr bool is_page_aligned(size_t size) {
     return (size & (page_size - 1)) == 0;
 }
 
+/* next_page_aligned指的是第一个大于等于size且能被page_size整除的数 */
 constexpr size_t next_page_aligned(size_t size) {
     return (size + (page_size - 1)) & ~(page_size - 1);
 }
@@ -237,12 +246,12 @@ struct free_object {
 };
 
 struct page {
-    bool free;
+    bool free;                /* 当前page是否空闲, 如果当前page被用作存储元信息(struct page), 那么在初始化的时候就会置false */
     uint8_t offset_in_span;
-    uint16_t nr_small_alloc;
-    uint32_t span_size; // in pages, if we're the head or the tail
-    page_list_link link;
-    small_pool* pool;  // if used in a small_pool
+    uint16_t nr_small_alloc;  /* 若当前span用于small_pool中, 统计当前span中可分配object的数量 */
+    uint32_t span_size;       /* in pages, if we're the head or the tail, 可以span多个连续的page, 如果是第一个或者最后一个page, span_size记录的是跨度的大小 */
+    page_list_link link;      /* 这里是从由物理连续page组成span的维度进行看，不同的span之间进行关联，组成链表 */
+    small_pool* pool;         /* if used in a small_pool, 如果当前page被用于small_pool，那么pool指向对应的small_pool对象 */
     free_object* freelist;
 #ifdef SEASTAR_HEAPPROF
     allocation_site_ptr alloc_site; // for objects whose size is multiple of page size, valid for head only
@@ -268,17 +277,24 @@ public:
             _front = span.link._next;
         }
     }
+    /* 将当前span插入到page_list中的头部 */
     void push_front(page* ary, page& span) {
+        /* 当前span中第一个page的索引, ary实际上就是整个内存块的
+         * 起始位置(pages元信息指向的位置) */
         auto idx = &span - ary;
         if (_front) {
+            /* 如果_front不为0, 则说明当前page_list中是有span的, 而
+             * _front则是链表中第一个span中第一个page的索引 */
             ary[_front].link._prev = idx;
         } else {
+            /* 否则说明当前page_list为空, 需要更新_back */
             _back = idx;
         }
         span.link._next = _front;
         span.link._prev = 0;
         _front = idx;
     }
+    /* 将page_list中头部的span进行移除 */
     void pop_front(page* ary) {
         if (ary[_front].link._next) {
             ary[ary[_front].link._next].link._prev = 0;
@@ -296,12 +312,15 @@ class small_pool {
         uint8_t fallback;
     };
     unsigned _object_size;
-    span_sizes _span_sizes;
-    free_object* _free = nullptr;
-    size_t _free_count = 0;
-    unsigned _min_free;
-    unsigned _max_free;
-    unsigned _pages_in_use = 0;
+    span_sizes _span_sizes;        /* 默认一个page是4k大小，_object_size如果大于4k, 需要多个连续的page合并起来才可以满足_object_size的大小这里的
+                                      _span_sizes指的就是page的跨度, 内部还细分了fallback和preferred(fallback <= preferred), 系统会先尝试分配
+                                      preferred个连续的page, 如果分配失败，则退而求其次分配fallback个连续page. 这里可能是考虑到在反复分配释放场景下
+                                      尽量去避免小的内存碎片？ 但是这样可能会引发内存空间的浪费? */
+    free_object* _free = nullptr;  /* 指向当前small_pool空闲对象的链表的头部 */
+    size_t _free_count = 0;        /* _free链表的长度 */
+    unsigned _min_free;            /* _min_free = _max_free / 2 */
+    unsigned _max_free;            /* _max_free指的是当前small_poll中最大可空闲对象的数量, 主要是预留部分空间，提升分配时的性能 */
+    unsigned _pages_in_use = 0;    /* 当前small_pool使用的page数量 */
     page_list _span_list;
     static constexpr unsigned idx_frac_bits = 2;
 public:
@@ -337,11 +356,13 @@ small_pool::size_to_idx(unsigned size) {
 
 class small_pool_array {
 public:
+    /* small_pool中支持最大的object_size大小为16k */
     static constexpr unsigned nr_small_pools = small_pool::size_to_idx(4 * page_size) + 1;
 private:
     union u {
         small_pool a[nr_small_pools];
         u() {
+            /* 调用small_pool的构造函数构造对象，入参是当前object_size */
             for (unsigned i = 0; i < nr_small_pools; ++i) {
                 new (&a[i]) small_pool(small_pool::idx_to_size(i));
             }
@@ -364,6 +385,8 @@ constexpr size_t object_size_with_alloc_site(size_t size) {
     static_assert(is_page_aligned(max_small_allocation), "assuming that max_small_allocation is page aligned so that we"
             " don't need to add allocation_site_ptr to objects of size close to it");
     size_t next_page_aligned_size = next_page_aligned(size);
+    /* 如果当前计算出的next_page_aligned_size相对于用户所需的size还有额外的sizeof(allocation_site_ptr)
+     * 用于存储一些元信息， 我们无需做任何操作，否则还需加上sizeof(allocation_site_ptr)的空间. */
     if (next_page_aligned_size - size > sizeof(allocation_site_ptr)) {
         size += sizeof(allocation_site_ptr);
     } else {
@@ -389,15 +412,18 @@ struct cross_cpu_free_item {
 
 struct cpu_pages {
     uint32_t min_free_pages = 20000000 / page_size;
-    char* memory;
-    page* pages;
-    uint32_t nr_pages;
-    uint32_t nr_free_pages;
+    char* memory;             /* 内存块的起始位置 */
+    page* pages;              /* 和上面的memory指向相同的位置，只不过指针的类型是page* */
+    uint32_t nr_pages;        /* 当前cpu可使用的总page数量 */
+    uint32_t nr_free_pages;   /* 可分配的空闲page数量 */
     uint32_t current_min_free_pages = 0;
     size_t large_allocation_warning_threshold = std::numeric_limits<size_t>::max();
     unsigned cpu_id = -1U;
     std::function<void (std::function<void ()>)> reclaim_hook;
     std::vector<reclaimer*> reclaimers;
+    /*  span是由物理相邻的若干个page构成的, 该数组是用于存储不同规格的span的,
+     *  同规格的span用链表链起来存储, span的大小可以认为是2 ^ idx
+     *  nr_span_lists为32，则说明span大小区间为[1 ~ 4GB] */
     static constexpr unsigned nr_span_lists = 32;
     page_list free_spans[nr_span_lists];  // contains aligned spans with span_size == 2^idx
     small_pool_array small_pools;
@@ -527,15 +553,21 @@ cpu_pages::link(page_list& list, page* span) {
     list.push_front(pages, *span);
 }
 
+/* 这个函数是释放[span_start, span_start + nr_pages - 1]这段区间内的page, 
+ * 这些page会组成一个新的span，被放到对应的fre_spans链表中
+ *
+ * span中的第一个page的元信息free字段会记录这个span是空闲的
+ * span中的第一个和最后一个page的元信息span_size字段会记录当前span是由几个连续
+ * pages组成的 */
 void cpu_pages::free_span_no_merge(uint32_t span_start, uint32_t nr_pages) {
     assert(nr_pages);
-    nr_free_pages += nr_pages;
+    nr_free_pages += nr_pages;     /* 当前是释放操作，更新空闲page数量 */
     auto span = &pages[span_start];
     auto span_end = &pages[span_start + nr_pages - 1];
     span->free = span_end->free = true;
     span->span_size = span_end->span_size = nr_pages;
     auto idx = index_of(nr_pages);
-    link(free_spans[idx], span);
+    link(free_spans[idx], span);   /* 将当前的span放入对应的free_spans集合中 */
 }
 
 bool cpu_pages::grow_span(uint32_t& span_start, uint32_t& nr_pages, unsigned idx) {
@@ -582,9 +614,14 @@ cpu_pages::find_and_unlink_span(unsigned n_pages) {
     if (n_pages >= (2u << idx)) {
         return nullptr;
     }
+    /* 通过n_pages计算符合要求最小span的索引, 如果该索引下没有span,
+     * 那么我们尝试取更高规格的span */
     while (idx < nr_span_lists && free_spans[idx].empty()) {
         ++idx;
     }
+    /* 如果idx == nr_span_lists则说明有可能还没初始化过?
+     * 这时我们调用一下initialize()函数，然后再继续调用
+     * 自身函数重试一下 */
     if (idx == nr_span_lists) {
         if (initialize()) {
             return find_and_unlink_span(n_pages);
@@ -593,6 +630,7 @@ cpu_pages::find_and_unlink_span(unsigned n_pages) {
     }
     auto& list = free_spans[idx];
     page* span = &list.front(pages);
+    /* 将当前的span从对应的list中移除 */
     unlink(list, span);
     return span;
 }
@@ -626,6 +664,8 @@ void*
 cpu_pages::allocate_large_and_trim(unsigned n_pages) {
     // Avoid exercising the reclaimers for requests we'll not be able to satisfy
     // nr_pages might be zero during startup, so check for that too
+    /* 如果当前期望分配连续page的数量比当前cpu可分配的总page数量都要多
+     * 那么直接返回nullptr */
     if (nr_pages && n_pages >= nr_pages) {
         return nullptr;
     }
@@ -633,10 +673,10 @@ cpu_pages::allocate_large_and_trim(unsigned n_pages) {
     if (!span) {
         return nullptr;
     }
-    auto span_size = span->span_size;
-    auto span_idx = span - pages;
-    nr_free_pages -= span->span_size;
-    while (span_size >= n_pages * 2) {
+    auto span_size = span->span_size;  /* 指的是当前span是由几个连续的page组合而成 */
+    auto span_idx = span - pages;      /* 这里的span实际上指向的是span中第一个page的地址, 所以span_idx指的就是这个page的索引 */
+    nr_free_pages -= span->span_size;  /* 新分配span, 剩余空闲page数需要减去当前span所占用pages数 */
+    while (span_size >= n_pages * 2) { /* 如果当前获取的span大小是我们需要分配的目标page数量两倍甚至以上, 那么实际上span的后半部分我们无需使用, 我们将其释放到对应的free_spans集合中 */
         span_size /= 2;
         auto other_span_idx = span_idx + span_size;
         free_span_no_merge(other_span_idx, span_size);
@@ -644,7 +684,7 @@ cpu_pages::allocate_large_and_trim(unsigned n_pages) {
     auto span_end = &pages[span_idx + span_size - 1];
     span->free = span_end->free = false;
     span->span_size = span_end->span_size = span_size;
-    span->pool = nullptr;
+    span->pool = nullptr;              /* 当span被用于对应的small_pool时，会进行对应的赋值操作，现在先进行置空 */
 #ifdef SEASTAR_HEAPPROF
     auto alloc_site = get_allocation_site();
     span->alloc_site = alloc_site;
@@ -822,8 +862,10 @@ bool cpu_pages::drain_cross_cpu_freelist() {
 }
 
 void cpu_pages::free(void* ptr) {
+    /* 先找到当前内存块对应的span */
     page* span = to_page(ptr);
     if (span->pool) {
+        /* 如果当前span属于某个small_pool, 找到对应的small_poll进行释放操作 */
         small_pool& pool = *span->pool;
 #ifdef SEASTAR_HEAPPROF
         allocation_site_ptr alloc_site = pool.alloc_site_holder(ptr);
@@ -913,8 +955,10 @@ bool cpu_pages::initialize() {
     cpu_id = cpu_id_gen.fetch_add(1, std::memory_order_relaxed);
     assert(cpu_id < max_cpus);
     all_cpus[cpu_id] = this;
+    /* 这里是拿mem_base()加上64GB的位移得到当前线程mem的起始位置,
+     * 这里目前应该是每个线程使用的内存上限是写死的(cpu_id_shift) */
     auto base = mem_base() + (size_t(cpu_id) << cpu_id_shift);
-    auto size = 32 << 20;  // Small size for bootstrap
+    auto size = 32 << 20;  /* Small size for bootstrap, 启动至少预留32MB */
     auto r = ::mmap(base, size,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
@@ -928,13 +972,30 @@ bool cpu_pages::initialize() {
     nr_pages = size / page_size;
     // we reserve the end page so we don't have to special case
     // the last span.
+
+    /* 分配器底层是划分为Page进行管理的, 描述Page需要存储元信息(struct page),
+     * 所以下面通过计算得出了使用reserved个Page可以存储描述nr_pages个Page的元
+     * 信息, 所以内存块的头部我们预留了reserved个Page用于存储pages数组.
+     *
+     *  memory = base
+     *  pages  = base
+     *
+     *    |<-------  reserverd * sizeof(page)  ------>|<----- (nr_pages - reserverd) * page_size ------|
+     *    |-------------------------------|-----------|------------------------------------------------|
+     *    |      [pages meta array]       | [padding] |       [(nr_pages - reserved) Pages Items]      | 
+     *    |-------------------------------|-----------|------------------------------------------------|
+     *    ^
+     *  base
+     */
     auto reserved = align_up(sizeof(page) * (nr_pages + 1), page_size) / page_size;
     reserved = 1u << log2ceil(reserved);
+    /* 头部reserved个page用于存储元信息, 所以将其对应的元信息描述成已使用状态 */
     for (pageidx i = 0; i < reserved; ++i) {
         pages[i].free = false;
     }
     pages[nr_pages].free = false;
     free_span_unaligned(reserved, nr_pages - reserved);
+    /* 对应cpu的内存分配器已初始化好，将其标记为存活状态 */
     live_cpus[cpu_id].store(true, std::memory_order_relaxed);
     return true;
 }
@@ -975,17 +1036,37 @@ void cpu_pages::replace_memory_backing(allocate_system_memory_fn alloc_sys_mem) 
 }
 
 void cpu_pages::do_resize(size_t new_size, allocate_system_memory_fn alloc_sys_mem) {
+    /* 目标内存所对应的page数量 */
     auto new_pages = new_size / page_size;
     if (new_pages <= nr_pages) {
         return;
     }
+    /*  1. 先计算出旧的内存块大小, 之前是nr_pages个页， 所以乘一下page_size, 就是对应的old_size.
+     *  2. 然后通过计算得出新旧内存的增量大小mmap_size，调用alloc_sys_mem进行分配.
+     *
+     *    |<----------------------------------------------------------- new_size ---------------------------------------------------------->|
+     *    |-------------------------------|-----------|------------------------------------------------|------------------------------------|
+     *    |    [old pages meta array]     | [padding] |              [Old Page Items]                  |      [Extended New Page items]     |
+     *    |-------------------------------|-----------|------------------------------------------------|------------------------------------|
+     *    |<---------------------------------------- old size ---------------------------------------->|<------------ mmap_size ----------->| 
+     *    ^                                                                                            ^
+     *  memory                                                                                    mmap_start
+     */
     auto old_size = nr_pages * page_size;
     auto mmap_start = memory + old_size;
     auto mmap_size = new_size - old_size;
     auto mem = alloc_sys_mem(mmap_start, mmap_size);
     mem.release();
     ::madvise(mmap_start, mmap_size, MADV_HUGEPAGE);
-    // one past last page structure is a sentinel
+    /* one past last page structure is a sentinel
+     *
+     * 1. 由于我们此次需要扩到new_pages个页, sizeof(page[new_pages + 1])是计算存放new_pages个页的meta信息需要多少空间,
+     *    new_page_array_pages则是需要多少个页能存下这些元信息.
+     * 2. 然后通过调用allocate_large函数来分配用于存放页meta的new_page_array_pages个连续页(这里需要注意的do_resize成功的前提是旧
+     *    的内存块要有足够的空间可以存储新内存块元信息, 也就是要求[Old Page Items]要有一定的连续空闲页, 所以调用方resize才采用渐
+     *    进式分配的策略来提升成功率), new_page_array指向新分配内存的起始位置.
+     * 3. 将旧内存块对应的页meta信息拷贝到new_page_array指向的内存位置(拷贝的内容实际上就是上图的[old pages meta arrays]).
+     */
     auto new_page_array_pages = align_up(sizeof(page[new_pages + 1]), page_size) / page_size;
     auto new_page_array
         = reinterpret_cast<page*>(allocate_large(new_page_array_pages));
@@ -995,6 +1076,14 @@ void cpu_pages::do_resize(size_t new_size, allocate_system_memory_fn alloc_sys_m
     std::copy(pages, pages + nr_pages, new_page_array);
     // mark new one-past-last page as taken to avoid boundary conditions
     new_page_array[new_pages].free = false;
+    /*
+     * 1. 获取[old pages meta array]的起始位置old_pages.
+     * 2. 计算[old pages meta array]占用的空间大小
+     * 3. 更新pages和nr_pages两个字段, 前者指向存储新内存块页面元信息的起始位置，后者表示新内存块的页面总数.
+     * 4. free_span_unaligned(old_pages_start, old_pages_size / page_size)是将[old pages meta array]的内存空间重置(因为其中的内容已经被copy到其他地方了).
+     * 5. free_span_unaligned(old_nr_pages, new_pages - old_nr_pages)是将新分配的[Extended New Page items]的内存空间重置.
+     *
+     * 在do_resize之前，应用层分配的内存块都是位于[Old Page Items]中的，这部分内存是不会释放的,  所以理论上是支持运行过程中动态扩容内存的. */
     auto old_pages = reinterpret_cast<char*>(pages);
     auto old_nr_pages = nr_pages;
     auto old_pages_size = align_up(sizeof(page[nr_pages + 1]), page_size);
@@ -1016,8 +1105,12 @@ void cpu_pages::do_resize(size_t new_size, allocate_system_memory_fn alloc_sys_m
 void cpu_pages::resize(size_t new_size, allocate_system_memory_fn alloc_memory) {
     new_size = align_down(new_size, huge_page_size);
     while (nr_pages * page_size < new_size) {
-        // don't reallocate all at once, since there might not
-        // be enough free memory available to relocate the pages array
+        /* don't reallocate all at once, since there might not
+         * be enough free memory available to relocate the pages array
+         *
+         * 这里采用渐进式分配的策略(每次扩的内存最多是之前的四倍)，主要是为了避免
+         * 如果是一步到位的话可能会无法满足用于存储page元信息的pages array对连续
+         * 内存块的需求 */
         auto tmp_size = std::min(new_size, 4 * nr_pages * page_size);
         do_resize(tmp_size, alloc_memory);
     }
@@ -1094,6 +1187,7 @@ small_pool::small_pool(unsigned object_size) noexcept
         ++span_size;
     }
     _span_sizes.preferred = span_size;
+    /* _max_free必须大于等于100，主要是控制预留当前small_pool的object数量，提升分配性能 */
     _max_free = std::max<unsigned>(100, span_bytes() * 2 / _object_size);
     _min_free = _max_free / 2;
 }
@@ -1114,6 +1208,7 @@ small_pool::allocate() {
     if (!_free) {
         return nullptr;
     }
+    /* 获取free_list_的头部object对象 */
     auto* obj = _free;
     _free = _free->next;
     --_free_count;
@@ -1126,6 +1221,7 @@ small_pool::deallocate(void* object) {
     o->next = _free;
     _free = o;
     ++_free_count;
+    /* 如果当前空闲object对象大于等于max_free, 则尝试进行trim操作 */
     if (_free_count >= _max_free) {
         trim_free_list();
     }
@@ -1134,6 +1230,7 @@ small_pool::deallocate(void* object) {
 void
 small_pool::add_more_objects() {
     auto goal = (_min_free + _max_free) / 2;
+    /* 如果当前small_pool中的_span_list非空, 优先从中分配object对象 */
     while (!_span_list.empty() && _free_count < goal) {
         page& span = _span_list.front(cpu_mem.pages);
         _span_list.pop_front(cpu_mem.pages);
@@ -1146,6 +1243,7 @@ small_pool::add_more_objects() {
             ++span.nr_small_alloc;
         }
     }
+    /* 希望将当前small_pool的空闲对象数量填充到大于等于goal */
     while (_free_count < goal) {
         disable_backtrace_temporarily dbt;
         auto span_size = _span_sizes.preferred;
@@ -1159,13 +1257,15 @@ small_pool::add_more_objects() {
         }
         auto span = cpu_mem.to_page(data);
         span_size = span->span_size;
-        _pages_in_use += span_size;
+        _pages_in_use += span_size;    /* 当前small_pool又分配了新的span, 更新_pages_in_use统计信息 */
+        /* 遍历span中所有的page, 并且进行赋值操作 */
         for (unsigned i = 0; i < span_size; ++i) {
             span[i].offset_in_span = i;
             span[i].pool = this;
         }
         span->nr_small_alloc = 0;
         span->freelist = nullptr;
+        /* 将当前span中可分配的object对象添加到free_list中, 并且对应的统计信息 */
         for (unsigned offset = 0; offset <= span_size * page_size - _object_size; offset += _object_size) {
             auto h = reinterpret_cast<free_object*>(data + offset);
             h->next = _free;
@@ -1262,6 +1362,9 @@ void* allocate(size_t size) {
     }
     void* ptr;
     if (size <= max_small_allocation) {
+      /* 如果需要分配的size满足max_small_allocation的要求, 那么通过small_poll进行分配,
+       * 此外由于数据块我们还需要记录一下额外的元信息，所以我们通过object_size_with_alloc_site
+       * 函数把我们真实需要的size给计算出来. */
         size = object_size_with_alloc_site(size);
         ptr = get_cpu_mem().allocate_small(size);
     } else {
